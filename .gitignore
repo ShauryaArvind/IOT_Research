@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+env/
+
+# Trained models
+*.pth
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# CSV datasets (remove this section if you want to upload your datasets)
+*.csv
