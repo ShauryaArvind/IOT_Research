@@ -17,3 +17,7 @@ env/
 
 # CSV datasets (remove this section if you want to upload your datasets)
 *.csv
+!X_train_final_balanced.csv
+!y_train_final_balanced.csv
+!X_test_isolated.csv
+!y_test_isolated.csv
