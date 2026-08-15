@@ -234,6 +234,7 @@ def main():
 
     print("\n" + "=" * 70)
     print("SUMMARY -- FGSM vs PGD")
+    
     print("=" * 70)
     print(f"{'Attack':<25}{'ML-only bypass':>18}{'ML+ZeroTrust bypass':>22}")
     for r in (fgsm_result, pgd_result):

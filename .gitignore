@@ -21,3 +21,4 @@ env/
 !y_train_final_balanced.csv
 !X_test_isolated.csv
 !y_test_isolated.csv
+!src/risk_engine/epsilon_sweep_results.csv
