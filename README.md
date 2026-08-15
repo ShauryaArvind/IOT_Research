@@ -104,10 +104,10 @@ The framework processes **78 network traffic flow features** (e.g., Flow Duratio
 - **Implementation**: [src/risk_engine/gan_augmentation.py](file:///c:/Users/Shaurya%20Arvind/OneDrive/Documents/IOT%20Research/src/risk_engine/gan_augmentation.py)
 - **Mechanism**: Generator conditions on random noise vector (`NOISE_DIM=32`) + target attack class label. Output features are inverse-transformed and clipped to physical min/max bounds.
 
-#### 📍 Phase 5: Adversarial Evasion Benchmarking (FGSM & PGD) `[COMPLETED ✅]`
-- **Objective**: Measure the classifier's vulnerability to gradient-based adversarial evasion tactics.
-- **Implementation**: [src/risk_engine/adversial_attack.py](file:///c:/Users/Shaurya%20Arvind/OneDrive/Documents/IOT%20Research/src/risk_engine/adversial_attack.py)
-- **Attacks Evaluated**: Fast Gradient Sign Method (FGSM, `epsilon=0.15`) and Projected Gradient Descent (PGD, 10 steps).
+#### 📍 Phase 5: Adversarial Evasion Benchmarking (FGSM, PGD & HopSkipJump) `[COMPLETED ✅]`
+- **Objective**: Measure the classifier's vulnerability to gradient-based (white-box) and decision-based (black-box) adversarial evasion tactics across fixed epsilons and continuous perturbation sweeps.
+- **Implementation**: [src/risk_engine/adversial_attack.py](file:///c:/Users/Shaurya%20Arvind/OneDrive/Documents/IOT%20Research/src/risk_engine/adversial_attack.py), [src/risk_engine/blackbox.py](file:///c:/Users/Shaurya%20Arvind/OneDrive/Documents/IOT%20Research/src/risk_engine/blackbox.py) & [src/risk_engine/sweep.py](file:///c:/Users/Shaurya%20Arvind/OneDrive/Documents/IOT%20Research/src/risk_engine/sweep.py)
+- **Attacks Evaluated**: Fast Gradient Sign Method (FGSM, `epsilon=0.15`: **93.8%** ML bypass), Projected Gradient Descent (PGD, 10-step: **96.7%** ML bypass), and HopSkipJump Black-Box Attack (**100.0%** unconstrained / **78.4%** query-budgeted).
 
 #### 📍 Phase 6: Context-Aware Zero-Trust Policy Engine (Defense-in-Depth) `[COMPLETED ✅]`
 - **Objective**: Ensure secondary defense mechanisms block attacks that succeed in fooling the ML classifier.
@@ -163,8 +163,8 @@ When evaluating correctly identified attack flows under adversarial perturbation
 
 | Defense Configuration | FGSM (White-Box) | PGD (White-Box) | HopSkipJump (Black-Box) | Interception / Block Rate | Status |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **ML Classifier Only** (No Context) | ~89.1% | ~96.2% | ~100.0% (Boundary Search) | Low (Vulnerable to Evasion) | Benchmark Established ✅ |
-| **ML + Zero-Trust Engine** (Defense-in-Depth) | **< 12.1%** | **< 14.8%** | **< 0.2%** | **> 99.8% Intercepted** | Evaluated ✅ |
+| **ML Classifier Only** (No Context) | **93.8%** | **96.7%** | **100.0%** *(Boundary Search)* | Low (Vulnerable to Evasion) | Benchmark Established ✅ |
+| **ML + Zero-Trust Engine** (Defense-in-Depth) | **0.0%** | **0.0%** | **0.2%** | **> 99.8% Intercepted** | Evaluated ✅ |
 | **ML + RL Adaptive Policy Engine + Autoencoder** | *Target: < 3%* | *Target: < 5%* | *Target: < 1%* | *Target: > 97% Intercepted* | Planned 🚀 |
 
 ---
