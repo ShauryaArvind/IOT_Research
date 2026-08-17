@@ -96,17 +96,18 @@ class ZeroTrustEngine:
     The 8 rules in priority order:
         1. Critical Resource Microsegment  (resource_sensitivity > 0.9 AND device_trust < 0.5)
         2. High-Risk ML Score              (ml_risk > 0.85)
-        3. Device Trust Threshold          (device_trust < 0.3)
-        4. Geo-Risk Threshold              (geo_risk > 0.8)
-        5. Compound Risk                   (ml_risk > 0.5 AND geo_risk > 0.6)
-        6. Off-Hours Anomaly               (off_hours AND device_trust < 0.5)
-        7. Identity Verification Failure   (NOT identity_verified AND ml_risk > 0.4)
-        8. Default Allow                   (always)
+        3. Novelty Risk Threshold          (novelty_risk > 0.6437)
+        4. Device Trust Threshold          (device_trust < 0.3)
+        5. Geo-Risk Threshold              (geo_risk > 0.8)
+        6. Compound Risk                   (ml_risk > 0.5 AND geo_risk > 0.6)
+        7. Off-Hours Anomaly               (off_hours AND device_trust < 0.5)
+        8. Identity Verification Failure   (NOT identity_verified AND ml_risk > 0.4)
+        9. Default Allow                   (always)
 
     Attributes:
         rules: List of PolicyRule objects defining the evaluation logic.
         enabled_factors: Set of context factors enabled for this instance.
-            Supports: {'device_trust', 'geo_risk', 'time_of_day', 'identity'}
+            Supports: {'device_trust', 'geo_risk', 'time_of_day', 'identity', 'novelty_risk'}
 
     Args:
         enabled_factors: Which contextual factors to use. Pass a subset
@@ -129,6 +130,8 @@ class ZeroTrustEngine:
         >>> print(result.decision)
         DENY
     """
+    # Phase 13 novelty detection threshold
+    NOVELTY_RISK_THRESHOLD = 0.6437319422245168
 
     # Class-level rule definitions for documentation and paper table
     RULE_TABLE = [
@@ -152,6 +155,15 @@ class ZeroTrustEngine:
         ),
         PolicyRule(
             priority=3,
+            name="Novelty Risk Threshold",
+            condition_desc="novelty_risk > 0.6437",
+            decision="DENY",
+            rationale="Traffic that falls outside the learned known-data "
+                      "distribution is treated as suspicious even when the "
+                      "classifier does not assign a high-risk class.",
+),
+        PolicyRule(
+            priority=4,
             name="Device Trust Threshold",
             condition_desc="device_trust < 0.3",
             decision="DENY",
@@ -160,7 +172,7 @@ class ZeroTrustEngine:
                       "devices not enrolled in the organization's MDM."
         ),
         PolicyRule(
-            priority=4,
+            priority=5,
             name="Geo-Risk Threshold",
             condition_desc="geo_risk > 0.8",
             decision="DENY",
@@ -169,7 +181,7 @@ class ZeroTrustEngine:
                       "Adversarial operators often route through anomalous IPs."
         ),
         PolicyRule(
-            priority=5,
+            priority=6,
             name="Compound Risk (ML + Geo)",
             condition_desc="ml_risk_score > 0.5 AND geo_risk > 0.6",
             decision="DENY",
@@ -178,7 +190,7 @@ class ZeroTrustEngine:
                       "ML confidence below the high threshold but remain suspicious."
         ),
         PolicyRule(
-            priority=6,
+            priority=7,
             name="Off-Hours Device Anomaly",
             condition_desc="time_of_day NOT IN [8,18] AND device_trust < 0.5",
             decision="DENY",
@@ -186,7 +198,7 @@ class ZeroTrustEngine:
                       "a behavioral anomaly consistent with after-hours intrusion attempts."
         ),
         PolicyRule(
-            priority=7,
+            priority=8,
             name="Identity Verification Failure",
             condition_desc="NOT identity_verified AND ml_risk_score > 0.4",
             decision="DENY",
@@ -194,7 +206,7 @@ class ZeroTrustEngine:
                       "potential credential compromise or session hijacking."
         ),
         PolicyRule(
-            priority=8,
+            priority=9,
             name="Default Allow",
             condition_desc="TRUE (no prior rule matched)",
             decision="ALLOW",
@@ -208,7 +220,13 @@ class ZeroTrustEngine:
         'ml_only': set(),
         'ml_device': {'device_trust'},
         'ml_geo': {'geo_risk'},
-        'full': {'device_trust', 'geo_risk', 'time_of_day', 'identity'},
+        'full': {
+            'device_trust',
+            'geo_risk',
+            'time_of_day',
+            'identity',
+            'novelty_risk'
+},
     }
 
     def __init__(self, enabled_factors: Optional[set] = None):
@@ -221,7 +239,13 @@ class ZeroTrustEngine:
                 Empty set means ML-only (no contextual factors).
         """
         if enabled_factors is None:
-            self.enabled_factors = {'device_trust', 'geo_risk', 'time_of_day', 'identity'}
+            self.enabled_factors = {
+        'device_trust',
+        'geo_risk',
+        'time_of_day',
+        'identity',
+        'novelty_risk'
+        }
         else:
             self.enabled_factors = set(enabled_factors)
 
@@ -244,6 +268,7 @@ class ZeroTrustEngine:
                 - time_of_day (int, 0-23): Hour of access attempt.
                 - identity_verified (bool): Whether identity was verified.
                 - resource_sensitivity (float, 0-1): Target resource sensitivity.
+                - novelty_risk (float, 0-1): Phase 13 novelty/suspiciousness score.
 
         Returns:
             AccessDecision with the final decision, firing rule, and audit trail.
@@ -264,6 +289,7 @@ class ZeroTrustEngine:
         time_of_day = context.get('time_of_day', 12)
         identity_verified = context.get('identity_verified', True)
         resource_sensitivity = context.get('resource_sensitivity', 0.5)
+        novelty_risk = context.get('novelty_risk', 0.0)
 
         is_off_hours = time_of_day < 8 or time_of_day > 18
 
@@ -277,36 +303,41 @@ class ZeroTrustEngine:
             ),
             # Rule 2: High-Risk ML Score (always active — ML is the base layer)
             ml_risk_score > 0.85,
-            # Rule 3: Device Trust Threshold
+            # Rule 3: Phase 13 Novelty Risk
+            (
+                'novelty_risk' in self.enabled_factors
+                and novelty_risk > self.NOVELTY_RISK_THRESHOLD
+            ),
+            # Rule 4: Device Trust Threshold
             (
                 'device_trust' in self.enabled_factors
                 and device_trust < 0.3
             ),
-            # Rule 4: Geo-Risk Threshold
+            # Rule 5: Geo-Risk Threshold
             (
                 'geo_risk' in self.enabled_factors
                 and geo_risk > 0.8
             ),
-            # Rule 5: Compound Risk (ML + Geo)
+            # Rule 6: Compound Risk (ML + Geo)
             (
                 'geo_risk' in self.enabled_factors
                 and ml_risk_score > 0.5
                 and geo_risk > 0.6
             ),
-            # Rule 6: Off-Hours Device Anomaly
+            # Rule 7   : Off-Hours Device Anomaly
             (
                 'time_of_day' in self.enabled_factors
                 and 'device_trust' in self.enabled_factors
                 and is_off_hours
                 and device_trust < 0.5
             ),
-            # Rule 7: Identity Verification Failure
+            # Rule 8: Identity Verification Failure
             (
                 'identity' in self.enabled_factors
                 and not identity_verified
                 and ml_risk_score > 0.4
             ),
-            # Rule 8: Default Allow (always True)
+            # Rule 9: Default Allow (always True)
             True,
         ]
 
