@@ -3,14 +3,27 @@ Comprehensive Edge Hardware Profiler & Benchmarking Suite
 =========================================================
 Part of Phase 11: Physical Edge Hardware Deployment & Benchmarking.
 
-Evaluates real-time inference latency, throughput scaling, memory footprint,
-and volumetric DDoS burst resilience for edge IoT gateways.
+Measures inference latency, throughput scaling, memory footprint and
+burst throughput of the ONNX pipeline ON THE MACHINE IT RUNS ON. The host
+(CPU, OS, ONNX Runtime version) is recorded with the results. Numbers from
+a laptop/desktop do not transfer to micro-controllers or gateways; run this
+on the target device (e.g. Raspberry Pi) before making edge claims.
+
+Fixes relative to the original version:
+  * flows come from the isolated test set (not the SMOTE training file);
+  * the PyTorch-native path standardises its input (it used to feed raw
+    features to the model);
+  * model footprint includes the external .onnx.data weight files;
+  * RAM is reported as RSS before/after loading and the delta, not just the
+    process total (which is dominated by the Python/ORT runtime);
+  * the burst test reports throughput only. Its "100% interception" came from
+    a hardcoded attacker context that triggers context-only DENY rules.
 
 Metrics Profiled:
   1. Per-Flow Processing Latency: Mean, p50, p90, p95, p99, Min, Max (µs and ms).
   2. Throughput Scaling: Sustained flows/sec across batch sizes [1 to 1024].
   3. Memory Footprint: Model on-disk size (KB) and Runtime RAM (RSS in MB).
-  4. DDoS Burst Stress Test: 10,000 rapid-fire adversarial flows under peak load.
+  4. Burst test: 10,000 flows processed in one batch (throughput only).
   5. Comparative Engine Profiling: PyTorch Native vs. ONNX Runtime.
 
 Outputs:
@@ -29,6 +42,8 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+import argparse
+import platform
 import time
 import psutil
 import numpy as np
@@ -38,20 +53,13 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from edge_inference_engine import EdgeDefensePipeline, ATTACK_TAXONOMY
-from Network_classifier import NetworkRiskClassifier
-from denoising_autoencoder import DenoisingAutoencoder
+from edge_inference_engine import EdgeDefensePipeline
 from zero_trust_engine import ZeroTrustEngine
 
 # ---------------------------------------------------------------------------
 # PATHS & CONFIGURATION
 # ---------------------------------------------------------------------------
-X_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'X_train_final_balanced.csv')
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
-
-BASELINE_PTH = os.path.join(MODELS_DIR, 'network_risk_classifier_multiclass.pth')
-ADV_PTH = os.path.join(MODELS_DIR, 'network_risk_classifier_adversarial.pth')
-DAE_PTH = os.path.join(MODELS_DIR, 'denoising_autoencoder.pth')
 
 BASELINE_ONNX = os.path.join(MODELS_DIR, 'network_risk_classifier.onnx')
 ADV_ONNX = os.path.join(MODELS_DIR, 'network_risk_classifier_adv.onnx')
@@ -78,12 +86,27 @@ def get_current_process_memory_mb():
     return process.memory_info().rss / (1024.0 * 1024.0)
 
 
-def load_test_flows(n_samples=2000):
-    """Loads a slice of real network flow data for realistic benchmarking."""
-    pprint("  Loading sample flow dataset for benchmarking...")
-    df = pd.read_csv(X_CSV_PATH, nrows=n_samples)
-    X = df.replace([np.inf, -np.inf], np.nan).fillna(0).values.astype(np.float32)
-    return X
+def host_info():
+    import onnxruntime
+    return {
+        'host_platform': platform.platform(),
+        'host_machine': platform.machine(),
+        'host_processor': platform.processor() or platform.machine(),
+        'host_cpu_count': os.cpu_count(),
+        'host_ram_gb': round(psutil.virtual_memory().total / 1024 ** 3, 1),
+        'onnxruntime_version': onnxruntime.__version__,
+        'python_version': platform.python_version(),
+    }
+
+
+def load_test_flows(n_samples=2000, seed=42):
+    """Raw (unscaled) flows sampled from the isolated test set."""
+    from data import TEST_FILES, read_xy
+    pprint("  Loading flows from the isolated test set...")
+    X, _ = read_xy(TEST_FILES)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(X), size=min(n_samples, len(X)), replace=False)
+    return X.iloc[idx].to_numpy(np.float32)
 
 
 def benchmark_single_flow_latency(edge_pipeline: EdgeDefensePipeline, test_flows: np.ndarray):
@@ -115,40 +138,34 @@ def benchmark_single_flow_latency(edge_pipeline: EdgeDefensePipeline, test_flows
     return np.array(latencies_us_full), np.array(latencies_us_clf)
 
 
-def benchmark_pytorch_native_latency(test_flows: np.ndarray, input_dim=76, num_classes=10):
-    """Benchmarks native PyTorch execution on CPU for direct runtime comparison."""
-    if not os.path.exists(ADV_PTH):
-        return np.zeros(len(test_flows)), np.zeros(len(test_flows))
+def benchmark_pytorch_native_latency(test_flows: np.ndarray, config: str, seed: int, robust_defense: str):
+    """Native PyTorch (preprocess + DAE + robust classifier + ZT) on CPU, for comparison."""
+    from denoising_autoencoder import load_dae
+    from training import load_run, run_dir
 
-    adv_model = NetworkRiskClassifier(input_dim=input_dim, num_classes=num_classes)
-    adv_model.load_state_dict(torch.load(ADV_PTH, map_location='cpu'))
-    adv_model.eval()
-
-    dae_model = DenoisingAutoencoder(input_dim=input_dim, latent_dim=16)
-    dae_model.load_state_dict(torch.load(DAE_PTH, map_location='cpu'))
-    dae_model.eval()
-
+    rd = run_dir(config, robust_defense, seed)
+    if not (rd / 'classifier.pth').exists():
+        pprint(f"  [-] no {robust_defense} run at {rd}; skipping PyTorch-native latency")
+        return None
+    adv_model, _, prep = load_run(rd)
+    dae_model, _ = load_dae(config, seed)
     zt_engine = ZeroTrustEngine()
     n_flows = len(test_flows)
 
-    # Warmup
+    def step(x):
+        t = torch.from_numpy(prep.transform(x[None, :]))
+        probs = torch.softmax(adv_model(dae_model(t)), dim=1).numpy()[0]
+        return zt_engine.evaluate(ml_risk_score=float(1.0 - probs[0]), context={'device_trust': 0.8, 'geo_risk': 0.2})
+
     with torch.no_grad():
         for i in range(WARMUP_TRIALS):
-            t = torch.FloatTensor(test_flows[i % n_flows]).unsqueeze(0)
-            _ = adv_model(dae_model(t))
-
-    latencies_us_pt_full = []
-    with torch.no_grad():
+            step(test_flows[i % n_flows])
+        lat = []
         for i in range(n_flows):
             start = time.perf_counter()
-            t = torch.FloatTensor(test_flows[i]).unsqueeze(0)
-            recon = dae_model(t)
-            logits = adv_model(recon)
-            probs = torch.softmax(logits, dim=1).numpy()[0]
-            _ = zt_engine.evaluate(ml_risk_score=float(1.0 - probs[0]), context={'device_trust': 0.8, 'geo_risk': 0.2})
-            latencies_us_pt_full.append((time.perf_counter() - start) * 1_000_000.0)
-
-    return np.array(latencies_us_pt_full)
+            step(test_flows[i])
+            lat.append((time.perf_counter() - start) * 1_000_000.0)
+    return np.array(lat)
 
 
 def benchmark_throughput_scaling(edge_pipeline: EdgeDefensePipeline, test_flows: np.ndarray):
@@ -187,184 +204,140 @@ def benchmark_throughput_scaling(edge_pipeline: EdgeDefensePipeline, test_flows:
 
 
 def benchmark_ddos_burst_stress(edge_pipeline: EdgeDefensePipeline, test_flows: np.ndarray, burst_count=DDOS_BURST_FLOWS):
-    """Simulates a sudden volumetric burst of 10,000 adversarial packet flows."""
+    """Time one batch of `burst_count` flows (tiled from the test sample)."""
     tile_count = int(np.ceil(burst_count / len(test_flows)))
     burst_data = np.tile(test_flows, (tile_count, 1))[:burst_count]
 
-    # Attacker context: anomalous geo, untrusted device
-    attacker_contexts = [{
-        'device_trust': 0.15,
-        'geo_risk': 0.92,
-        'time_of_day': 3,
-        'identity_verified': False,
-        'resource_sensitivity': 0.85
-    } for _ in range(burst_count)]
-
     mem_before = get_current_process_memory_mb()
     start_time = time.perf_counter()
-
-    results = edge_pipeline.process_batch(burst_data, attacker_contexts)
-
+    edge_pipeline.process_batch(burst_data)
     total_time = time.perf_counter() - start_time
     mem_after = get_current_process_memory_mb()
-
-    intercepted = sum(1 for r in results if r.decision == 'DENY')
-    interception_rate = (intercepted / burst_count) * 100.0
-    throughput = burst_count / total_time
 
     return {
         'burst_flows': burst_count,
         'total_duration_sec': total_time,
-        'sustained_throughput_fps': throughput,
-        'interception_rate_pct': interception_rate,
+        'sustained_throughput_fps': burst_count / total_time,
         'memory_delta_mb': mem_after - mem_before,
-        'peak_memory_mb': mem_after
+        'peak_memory_mb': mem_after,
     }
 
 
-def execute_edge_benchmark():
-    pprint("=" * 80)
-    pprint("PHASE 11: PHYSICAL EDGE HARDWARE PERFORMANCE & STRESS BENCHMARK")
-    pprint("=" * 80)
+def execute_edge_benchmark(argv=None):
+    from export_onnx import onnx_size_kb
+    from training import DEFAULT_CONFIG
 
-    test_flows = load_test_flows(N_LATENCY_TRIALS)
-    input_dim = test_flows.shape[1]
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', default=DEFAULT_CONFIG)
+    ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--robust-defense', default='pgd_at')
+    ap.add_argument('--threads', type=int, default=2)
+    a = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
-    # Model File Sizes on Disk
-    pth_size_kb = (os.path.getsize(ADV_PTH) / 1024.0) if os.path.exists(ADV_PTH) else 0.0
-    onnx_clf_size_kb = (os.path.getsize(ADV_ONNX) / 1024.0) if os.path.exists(ADV_ONNX) else 0.0
-    onnx_dae_size_kb = (os.path.getsize(DAE_ONNX) / 1024.0) if os.path.exists(DAE_ONNX) else 0.0
+    pprint("=" * 80)
+    pprint("PHASE 11: EDGE RUNTIME BENCHMARK (host machine, see host info below)")
+    pprint("=" * 80)
+    host = host_info()
+    for k, v in host.items():
+        pprint(f"  {k:<20}: {v}")
+
+    rss_start = get_current_process_memory_mb()
+    test_flows = load_test_flows(N_LATENCY_TRIALS, a.seed)
+
+    onnx_clf_size_kb = onnx_size_kb(ADV_ONNX) if os.path.exists(ADV_ONNX) else 0.0
+    onnx_dae_size_kb = onnx_size_kb(DAE_ONNX) if os.path.exists(DAE_ONNX) else 0.0
     total_edge_footprint_kb = onnx_clf_size_kb + onnx_dae_size_kb
 
-    pprint(f"\n[1/5] Edge Footprint & Storage Profiling:")
-    pprint(f"  PyTorch Checkpoint (.pth) : {pth_size_kb:.1f} KB")
-    pprint(f"  ONNX Classifier Model     : {onnx_clf_size_kb:.1f} KB")
-    pprint(f"  ONNX DAE Pre-Filter Model : {onnx_dae_size_kb:.1f} KB")
-    pprint(f"  Total Edge Model Footprint: {total_edge_footprint_kb:.1f} KB (< 0.2 MB)")
+    pprint("\n[1/5] Model footprint on disk (graph + external weights):")
+    pprint(f"  ONNX classifier : {onnx_clf_size_kb:.1f} KB")
+    pprint(f"  ONNX DAE        : {onnx_dae_size_kb:.1f} KB")
+    pprint(f"  Total           : {total_edge_footprint_kb:.1f} KB")
 
-    # Initialize Edge Pipeline
+    rss_before_models = get_current_process_memory_mb()
     edge_pipeline = EdgeDefensePipeline(
         classifier_onnx_path=ADV_ONNX,
         dae_onnx_path=DAE_ONNX,
         enable_dae_sanitization=True,
-        num_threads=2
+        num_threads=a.threads
     )
+    rss_after_models = get_current_process_memory_mb()
 
-    # 1. Single Flow Latency Profiling
-    pprint(f"\n[2/5] Profiling Per-Flow Latency over {N_LATENCY_TRIALS} sequential packet flows...")
+    pprint(f"\n[2/5] Per-flow latency over {N_LATENCY_TRIALS} sequential flows...")
     lat_onnx_full, lat_onnx_clf = benchmark_single_flow_latency(edge_pipeline, test_flows)
-    lat_pt_full = benchmark_pytorch_native_latency(test_flows, input_dim=input_dim)
+    lat_pt_full = benchmark_pytorch_native_latency(test_flows, a.config, a.seed, a.robust_defense)
+
+    def row(name, lat):
+        pprint(f"{name:<38} | {np.mean(lat):>9.1f} | {np.percentile(lat, 50):>8.1f} | "
+               f"{np.percentile(lat, 95):>8.1f} | {np.percentile(lat, 99):>8.1f}")
 
     pprint("\n" + "-" * 75)
     pprint(f"{'Runtime Configuration':<38} | {'Mean (µs)':<10} | {'p50 (µs)':<9} | {'p95 (µs)':<9} | {'p99 (µs)':<9}")
     pprint("-" * 75)
-    pprint(f"{'1. PyTorch Native (DAE + AT + ZT)':<38} | {np.mean(lat_pt_full):>9.1f} | {np.percentile(lat_pt_full, 50):>8.1f} | {np.percentile(lat_pt_full, 95):>8.1f} | {np.percentile(lat_pt_full, 99):>8.1f}")
-    pprint(f"{'2. ONNX Runtime (Classifier Only)':<38} | {np.mean(lat_onnx_clf):>9.1f} | {np.percentile(lat_onnx_clf, 50):>8.1f} | {np.percentile(lat_onnx_clf, 95):>8.1f} | {np.percentile(lat_onnx_clf, 99):>8.1f}")
-    pprint(f"{'3. ONNX Full Defense (DAE + AT + ZT)':<38} | {np.mean(lat_onnx_full):>9.1f} | {np.percentile(lat_onnx_full, 50):>8.1f} | {np.percentile(lat_onnx_full, 95):>8.1f} | {np.percentile(lat_onnx_full, 99):>8.1f}")
+    if lat_pt_full is not None:
+        row('1. PyTorch Native (DAE + AT + ZT)', lat_pt_full)
+    row('2. ONNX Runtime (Classifier Only)', lat_onnx_clf)
+    row('3. ONNX Full Defense (DAE + AT + ZT)', lat_onnx_full)
     pprint("-" * 75)
-    pprint(f"  [+] Average Full Defense Decision Latency: {np.mean(lat_onnx_full)/1000.0:.3f} ms ({np.mean(lat_onnx_full):.1f} µs) -> SUB-MILLISECOND!")
 
-    # 2. Throughput Scaling
-    pprint("\n[3/5] Benchmarking Batch Throughput Scaling across edge batch sizes...")
+    pprint("\n[3/5] Batch throughput scaling...")
     df_throughput = benchmark_throughput_scaling(edge_pipeline, test_flows)
     pprint("-" * 75)
-    pprint(f"{'Batch Size':<12} | {'Throughput (Flows/sec)':<25} | {'Avg Latency / Flow':<20} | {'Equivalent Mpps':<15}")
+    pprint(f"{'Batch Size':<12} | {'Throughput (Flows/sec)':<25} | {'Avg Latency / Flow':<20}")
     pprint("-" * 75)
-    for _, row in df_throughput.iterrows():
-        pprint(f"{int(row['batch_size']):<12} | {row['flows_per_sec']:>23,.1f} | {row['avg_latency_ms']*1000:>15.1f} µs | {row['mpps_equivalent']:>13.4f}")
+    for _, r in df_throughput.iterrows():
+        pprint(f"{int(r['batch_size']):<12} | {r['flows_per_sec']:>23,.1f} | {r['avg_latency_ms']*1000:>15.1f} µs")
     pprint("-" * 75)
 
-    # 3. DDoS Volumetric Burst Test
-    pprint(f"\n[4/5] Executing Simulated DDoS Volumetric Burst Stress Test ({DDOS_BURST_FLOWS:,} flows)...")
+    pprint(f"\n[4/5] Burst test ({DDOS_BURST_FLOWS:,} flows in one batch)...")
     ddos_res = benchmark_ddos_burst_stress(edge_pipeline, test_flows, DDOS_BURST_FLOWS)
-    pprint(f"  Total Burst Duration : {ddos_res['total_duration_sec']:.3f} seconds")
-    pprint(f"  Sustained Throughput : {ddos_res['sustained_throughput_fps']:,.1f} flows / second")
-    pprint(f"  Zero-Trust Block Rate: {ddos_res['interception_rate_pct']:.2f}% Intercepted")
-    pprint(f"  Peak Process RAM     : {ddos_res['peak_memory_mb']:.1f} MB (Memory stable, no leaks)")
+    pprint(f"  Duration   : {ddos_res['total_duration_sec']:.3f} s")
+    pprint(f"  Throughput : {ddos_res['sustained_throughput_fps']:,.1f} flows / s")
+    pprint(f"  RSS        : start {rss_start:.1f} MB | before models {rss_before_models:.1f} MB | "
+           f"after models {rss_after_models:.1f} MB | after burst {ddos_res['peak_memory_mb']:.1f} MB")
+    pprint("  (RSS is dominated by the Python + NumPy + ONNX Runtime process, not by the models.)")
 
-    # 4. Save Benchmark CSV
     df_throughput['single_flow_p50_us'] = np.percentile(lat_onnx_full, 50)
     df_throughput['single_flow_p95_us'] = np.percentile(lat_onnx_full, 95)
     df_throughput['single_flow_p99_us'] = np.percentile(lat_onnx_full, 99)
     df_throughput['onnx_total_size_kb'] = total_edge_footprint_kb
-    df_throughput['peak_ram_mb'] = ddos_res['peak_memory_mb']
+    df_throughput['rss_before_models_mb'] = rss_before_models
+    df_throughput['rss_models_delta_mb'] = rss_after_models - rss_before_models
+    df_throughput['rss_after_burst_mb'] = ddos_res['peak_memory_mb']
+    for k, v in host.items():
+        df_throughput[k] = v
     df_throughput.to_csv(CSV_RESULTS_PATH, index=False)
     pprint(f"\n[5/5] Saved numerical benchmark results to: {CSV_RESULTS_PATH}")
 
-    # 5. Generate Multi-Panel Visualization Plot
-    generate_edge_visualization(lat_pt_full, lat_onnx_clf, lat_onnx_full, df_throughput, ddos_res)
-
-    pprint("\n" + "=" * 80)
-    pprint("PHASE 11 EDGE HARDWARE BENCHMARK COMPLETE!")
-    pprint("=" * 80)
+    generate_edge_visualization(lat_pt_full, lat_onnx_clf, lat_onnx_full, df_throughput, host)
 
 
-def generate_edge_visualization(lat_pt, lat_onnx_clf, lat_onnx_full, df_tp, ddos_res):
-    """Generates a 3-panel publication-grade edge performance plot."""
+def generate_edge_visualization(lat_pt, lat_onnx_clf, lat_onnx_full, df_tp, host):
+    """Two-panel plot: single-flow latency distribution and batch throughput."""
     plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5.2))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.2))
 
-    # Panel 1: Single-Flow Latency Boxplot
-    lat_data = [lat_pt, lat_onnx_clf, lat_onnx_full]
-    labels = ['PyTorch (Full)', 'ONNX (Clf Only)', 'ONNX (Full Defense)']
-    colors = ['#f0ad4e', '#5bc0de', '#5cb85c']
-
-    bp = ax1.boxplot(lat_data, tick_labels=labels, patch_artist=True, showfliers=False, medianprops=dict(color='black', linewidth=1.5))
-    for patch, color in zip(bp['boxes'], colors):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.8)
-
-    ax1.set_title('Single-Flow Processing Latency Distribution', fontsize=11, fontweight='bold', pad=10)
-    ax1.set_ylabel('Latency (Microseconds - µs)', fontsize=10)
-    ax1.grid(True, linestyle='--', alpha=0.6)
-
-    # Annotate p50 values
+    lat_data, labels = [lat_onnx_clf, lat_onnx_full], ['ONNX (Clf Only)', 'ONNX (Full Defense)']
+    if lat_pt is not None:
+        lat_data, labels = [lat_pt] + lat_data, ['PyTorch (Full)'] + labels
+    ax1.boxplot(lat_data, tick_labels=labels, showfliers=False)
+    ax1.set_title('Single-flow latency', fontsize=11)
+    ax1.set_ylabel('Latency (µs)')
     for i, data in enumerate(lat_data):
         med = np.percentile(data, 50)
-        ax1.text(i + 1, med + 15, f'{med:.0f} µs', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        ax1.text(i + 1, med, f' {med:.0f} µs', ha='left', va='center', fontsize=9)
 
-    # Panel 2: Throughput vs Batch Size
-    ax2.plot(df_tp['batch_size'], df_tp['flows_per_sec'], 'b-o', linewidth=2.2, markersize=6, label='ONNX Edge Throughput')
-    ax2.set_title('Edge Gateway Throughput Scaling', fontsize=11, fontweight='bold', pad=10)
-    ax2.set_xlabel('Inference Batch Size', fontsize=10)
-    ax2.set_ylabel('Throughput (Flows / Second)', fontsize=10)
+    ax2.plot(df_tp['batch_size'], df_tp['flows_per_sec'], 'o-')
+    ax2.set_title('Batch throughput', fontsize=11)
+    ax2.set_xlabel('Batch size')
+    ax2.set_ylabel('Flows / second')
     ax2.set_xscale('log', base=2)
-    ax2.grid(True, linestyle='--', alpha=0.6)
 
-    # Highlight peak throughput
-    peak_tp = df_tp['flows_per_sec'].max()
-    peak_bsz = df_tp.loc[df_tp['flows_per_sec'].idxmax(), 'batch_size']
-    ax2.annotate(f'Peak: {peak_tp:,.0f} flows/sec\n(batch={peak_bsz})',
-                 xy=(peak_bsz, peak_tp), xytext=(peak_bsz * 0.4, peak_tp * 0.75),
-                 arrowprops=dict(facecolor='black', shrink=0.08, width=1, headwidth=6),
-                 fontsize=9, fontweight='bold', bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.5))
-
-    # Panel 3: DDoS Volumetric Burst & Resource Footprint
-    categories = ['Model Size\n(KB)', 'RAM RSS\n(MB)', 'Burst Rate\n(k-flows/s)', 'Interception\nRate (%)']
-    values = [
-        df_tp['onnx_total_size_kb'].iloc[0],
-        ddos_res['peak_memory_mb'],
-        ddos_res['sustained_throughput_fps'] / 1000.0,
-        ddos_res['interception_rate_pct']
-    ]
-    bar_colors = ['#0275d8', '#6f42c1', '#d9534f', '#5cb85c']
-
-    bars = ax3.bar(categories, values, color=bar_colors, width=0.55, edgecolor='black', linewidth=1)
-    ax3.set_title('Edge Resource Footprint & DDoS Resilience', fontsize=11, fontweight='bold', pad=10)
-    ax3.grid(axis='y', linestyle='--', alpha=0.6)
-
-    for bar, val in zip(bars, values):
-        height = bar.get_height()
-        ax3.annotate(f'{val:.1f}',
-                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=9, fontweight='bold')
-
+    fig.suptitle(f"Host: {host['host_processor']} ({host['host_platform']}), "
+                 f"ORT {host['onnxruntime_version']}. Not an edge-device measurement.", fontsize=9)
     plt.tight_layout()
-    plt.savefig(PLOT_PATH, dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_PATH, dpi=200, bbox_inches='tight')
     plt.close()
-    pprint(f"  [+] Saved Edge Performance Visualization to: {PLOT_PATH}")
+    pprint(f"  [+] Saved plot to: {PLOT_PATH}")
 
 
 if __name__ == '__main__':

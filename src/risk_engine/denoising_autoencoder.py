@@ -1,41 +1,35 @@
 """
-Denoising Autoencoder (DAE) for Network Flow Feature Sanitization & Anomaly Detection
-======================================================================================
-Part of Phase 10: Advanced Adversarial Robustness & Denoising Autoencoders.
+Denoising Autoencoder (DAE) for network flow features (Phase 10).
 
-Functions as a defense pre-filtering layer placed ahead of the classifier.
-When adversarial perturbations (e.g. FGSM, PGD) shift feature vectors away from
-the natural manifold of network flows, the DAE reconstructs the perturbed inputs
-back onto the clean distribution manifold prior to classifier inference.
+Two ways to use it (both evaluated in evaluate_robustness.py):
+  1. Denoiser: x -> DAE(x) -> classifier. The legacy pipeline. On the legacy
+     numbers this costs a lot of clean accuracy (37% error at eps=0), so it
+     must always be reported next to its clean metrics.
+  2. Detector: reject any flow whose reconstruction error exceeds a threshold
+     calibrated on clean VALIDATION flows (p95 / p99). The classifier sees the
+     unmodified input, so clean accuracy is unchanged and the cost shows up
+     as benign false-positive rate instead.
 
-Key Capabilities:
-  1. Denoising Reconstruction: Removes high-frequency adversarial noise and perturbations.
-  2. Latent Projection: Compresses 78 features into a compact 16-dim representation.
-  3. Reconstruction Anomaly Detection: Computes per-flow MSE reconstruction error.
-     Anomalous perturbation magnitudes can be routed directly to the Zero-Trust Engine.
+Training uses the shared protocol (data.py): train split for fitting, the
+validation split for checkpoint selection and threshold calibration. The
+isolated test set is not touched here.
+
+Usage:
+    python src/risk_engine/denoising_autoencoder.py --config legacy_balanced --seeds 42
 """
 
+import argparse
+import json
 import os
 import sys
+
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-X_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'X_train_final_balanced.csv')
-Y_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'y_train_final_balanced.csv')
-MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
-DAE_MODEL_PATH = os.path.join(MODELS_DIR, 'denoising_autoencoder.pth')
 
 RANDOM_STATE = 42
-TEST_SIZE = 0.2
 EPOCHS = 25
 BATCH_SIZE = 256
 LEARNING_RATE = 0.001
@@ -51,18 +45,18 @@ def pprint(*args, **kwargs):
 
 class DenoisingAutoencoder(nn.Module):
     """
-    Symmetric Deep Denoising Autoencoder for tabular IoT network flow representations.
-    
-    Architecture:
-      Encoder: Input (78) -> Linear(64) -> BatchNorm -> LeakyReLU -> Dropout(0.1)
-                          -> Linear(32) -> BatchNorm -> LeakyReLU
-                          -> Linear(16) [Bottleneck Latent Space]
+    Symmetric Deep Denoising Autoencoder for tabular network flow features.
+
+    Architecture (input_dim = number of feature columns, 76 in the committed data):
+      Encoder: Input -> Linear(64) -> BatchNorm -> LeakyReLU -> Dropout(0.1)
+                     -> Linear(32) -> BatchNorm -> LeakyReLU
+                     -> Linear(16) [Bottleneck Latent Space]
       Decoder: Latent (16) -> Linear(32) -> BatchNorm -> LeakyReLU
                            -> Linear(64) -> BatchNorm -> LeakyReLU
-                           -> Linear(78) [Reconstructed Clean Features]
+                           -> Linear(input_dim) [Reconstructed Features]
     """
 
-    def __init__(self, input_dim=78, latent_dim=16):
+    def __init__(self, input_dim=76, latent_dim=16):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
@@ -100,57 +94,27 @@ class DenoisingAutoencoder(nn.Module):
 
     def forward(self, x):
         """Pass input through encoder and decoder to reconstruct clean features."""
-        z = self.encoder(x)
-        x_recon = self.decoder(z)
-        return x_recon
+        return self.decoder(self.encoder(x))
 
     def sanitize(self, X):
-        """
-        Sanitize / denoise a batch of network flow feature vectors.
-
-        Args:
-            X: Input feature vectors (numpy array or torch.Tensor)
-
-        Returns:
-            Sanitized feature vectors of identical shape and type.
-        """
+        """Denoise a batch of (scaled) flow feature vectors. Same type in, same type out."""
         is_numpy = isinstance(X, np.ndarray)
-        if is_numpy:
-            X_tensor = torch.FloatTensor(X)
-        else:
-            X_tensor = X
-
+        X_tensor = torch.FloatTensor(X) if is_numpy else X
         self.eval()
         with torch.no_grad():
-            sanitized_tensor = self.forward(X_tensor)
+            out = self.forward(X_tensor)
+        return out.cpu().numpy() if is_numpy else out
 
-        if is_numpy:
-            return sanitized_tensor.cpu().numpy()
-        return sanitized_tensor
+    def reconstruction_error(self, X: torch.Tensor) -> torch.Tensor:
+        """Differentiable per-sample MSE (used by the adaptive detector attack)."""
+        return torch.mean((X - self.forward(X)) ** 2, dim=1)
 
     def compute_reconstruction_error(self, X):
-        """
-        Computes per-sample Mean Squared Error (MSE) reconstruction loss.
-        High reconstruction error signals out-of-distribution or adversarial manipulation.
-
-        Args:
-            X: Input feature vectors (numpy array or torch.Tensor)
-
-        Returns:
-            numpy array of reconstruction errors (shape: (N,))
-        """
-        is_numpy = isinstance(X, np.ndarray)
-        if is_numpy:
-            X_tensor = torch.FloatTensor(X)
-        else:
-            X_tensor = X
-
+        """Per-sample reconstruction MSE as a numpy array, shape (N,)."""
+        X_tensor = torch.FloatTensor(X) if isinstance(X, np.ndarray) else X
         self.eval()
         with torch.no_grad():
-            reconstructed = self.forward(X_tensor)
-            mse_per_sample = torch.mean((X_tensor - reconstructed) ** 2, dim=1)
-
-        return mse_per_sample.cpu().numpy()
+            return self.reconstruction_error(X_tensor).cpu().numpy()
 
 
 def inject_training_noise(x_clean, noise_std=NOISE_STD, corruption_prob=CORRUPTION_PROB):
@@ -160,115 +124,108 @@ def inject_training_noise(x_clean, noise_std=NOISE_STD, corruption_prob=CORRUPTI
     """
     noise = torch.randn_like(x_clean) * noise_std
     uniform_jitter = (torch.rand_like(x_clean) - 0.5) * 2.0 * noise_std
-
-    # Apply random zero-masking
     mask = (torch.rand_like(x_clean) > corruption_prob).float()
-
-    x_noisy = (x_clean + noise + uniform_jitter) * mask
-    return x_noisy
+    return (x_clean + noise + uniform_jitter) * mask
 
 
-def load_and_prepare_data():
-    """Load dataset and perform standardized train/test split."""
-    pprint("  Loading raw dataset from CSV...")
-    X = pd.read_csv(X_CSV_PATH).replace([np.inf, -np.inf], np.nan).fillna(0).values.astype(np.float32)
-    y = pd.read_csv(Y_CSV_PATH).iloc[:, 0].values.astype(np.int64)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
-    )
-
-    scaler = StandardScaler().fit(X_train)
-    X_train_scaled = scaler.transform(X_train).astype(np.float32)
-    X_test_scaled = scaler.transform(X_test).astype(np.float32)
-
-    return X_train_scaled, X_test_scaled, y_train, y_test, scaler
+def dae_run_dir(config, seed):
+    from training import run_dir
+    return run_dir(config, 'dae', seed)
 
 
-def train_denoising_autoencoder():
-    """Trains the Denoising Autoencoder to reconstruct clean flow features from noisy inputs."""
+def train_denoising_autoencoder(config=None, seed=RANDOM_STATE, epochs=EPOCHS, splits=None):
+    """Train the DAE on the train split, select on val, calibrate detector thresholds on val."""
+    from training import DEFAULT_CONFIG, set_seed, splits_for_config
+
+    config = config or DEFAULT_CONFIG
+    set_seed(seed)
     pprint("=" * 75)
-    pprint("Phase 10: Training Denoising Autoencoder (DAE) Pre-Filtering Sanitizer")
+    pprint(f"Phase 10: Denoising Autoencoder | config={config} seed={seed}")
     pprint("=" * 75)
 
-    X_train_scaled, X_test_scaled, y_train, y_test, scaler = load_and_prepare_data()
-    input_dim = X_train_scaled.shape[1]
+    if splits is None:
+        splits = splits_for_config(config, seed)
+    X_tr = torch.FloatTensor(splits.X_train)
+    X_val = torch.FloatTensor(splits.X_val)
+    input_dim = X_tr.shape[1]
 
-    pprint(f"  Input Features: {input_dim} | Training Samples: {X_train_scaled.shape[0]} | Test: {X_test_scaled.shape[0]}")
-
-    X_train_t = torch.FloatTensor(X_train_scaled)
-    X_test_t = torch.FloatTensor(X_test_scaled)
-
-    train_dataset = TensorDataset(X_train_t)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    test_dataset = TensorDataset(X_test_t)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    g = torch.Generator().manual_seed(seed)
+    train_loader = DataLoader(TensorDataset(X_tr), batch_size=BATCH_SIZE, shuffle=True, generator=g)
+    val_loader = DataLoader(TensorDataset(X_val), batch_size=4096, shuffle=False)
 
     model = DenoisingAutoencoder(input_dim=input_dim, latent_dim=16)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    mse_criterion = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    mse = nn.MSELoss()
 
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    best_val_loss = float('inf')
+    out_dir = dae_run_dir(config, seed)
+    os.makedirs(out_dir, exist_ok=True)
+    best_val, best_state = float('inf'), None
 
-    pprint(f"\n  Starting DAE training for {EPOCHS} epochs...")
-    pprint("-" * 75)
-
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         model.train()
         train_loss = 0.0
-
-        for (batch_x,) in train_loader:
-            batch_x_noisy = inject_training_noise(batch_x, noise_std=NOISE_STD, corruption_prob=CORRUPTION_PROB)
-
+        for (xb,) in train_loader:
+            recon = model(inject_training_noise(xb))
+            loss = mse(recon, xb) + 0.1 * (1.0 - F.cosine_similarity(recon, xb, dim=1).mean())
             optimizer.zero_grad()
-            batch_recon = model(batch_x_noisy)
-
-            # Combined loss: MSE reconstruction + Cosine direction similarity
-            mse_loss = mse_criterion(batch_recon, batch_x)
-            cosine_loss = 1.0 - F.cosine_similarity(batch_recon, batch_x, dim=1).mean()
-            loss = mse_loss + 0.1 * cosine_loss
-
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-
         scheduler.step()
-        avg_train_loss = train_loss / len(train_loader)
 
-        # Validation on test set (with test noise)
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for (batch_x,) in test_loader:
-                batch_x_noisy = inject_training_noise(batch_x, noise_std=NOISE_STD, corruption_prob=CORRUPTION_PROB)
-                batch_recon = model(batch_x_noisy)
-                loss = mse_criterion(batch_recon, batch_x)
-                val_loss += loss.item()
+            for (xb,) in val_loader:
+                val_loss += mse(model(inject_training_noise(xb)), xb).item() * len(xb)
+        val_loss /= len(X_val)
+        pprint(f"  Epoch [{epoch+1:02d}/{epochs:02d}] | Train Loss: {train_loss/len(train_loader):.5f} "
+               f"| Val MSE (noisy->clean): {val_loss:.5f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-        avg_val_loss = val_loss / len(test_loader)
+    model.load_state_dict(best_state)
+    model.eval()
+    torch.save(best_state, out_dir / 'dae.pth')
 
-        pprint(f"  Epoch [{epoch+1:02d}/{EPOCHS:02d}] | Train Loss: {avg_train_loss:.5f} | Val MSE: {avg_val_loss:.5f}")
+    clean_err = model.compute_reconstruction_error(splits.X_val)
+    meta = {
+        'config': config, 'seed': seed, 'input_dim': input_dim, 'best_val_mse': best_val,
+        'threshold_p95': float(np.percentile(clean_err, 95)),
+        'threshold_p99': float(np.percentile(clean_err, 99)),
+        'val_clean_error_mean': float(clean_err.mean()),
+        'data': splits.info,
+    }
+    with open(out_dir / 'meta.json', 'w') as f:
+        json.dump(meta, f, indent=2)
+    pprint(f"  Clean val reconstruction error: mean {meta['val_clean_error_mean']:.4f} | "
+           f"p95 {meta['threshold_p95']:.4f} | p99 {meta['threshold_p99']:.4f}")
+    pprint(f"  Saved -> {out_dir}")
+    return model, meta
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), DAE_MODEL_PATH)
 
-    pprint("-" * 75)
-    pprint(f"DAE Training Complete! Best Val MSE: {best_val_loss:.5f}")
-    pprint(f"Checkpoint saved to: {DAE_MODEL_PATH}")
+def load_dae(config, seed):
+    d = dae_run_dir(config, seed)
+    with open(d / 'meta.json') as f:
+        meta = json.load(f)
+    model = DenoisingAutoencoder(input_dim=meta['input_dim'], latent_dim=16)
+    model.load_state_dict(torch.load(d / 'dae.pth', map_location='cpu'))
+    model.eval()
+    return model, meta
 
-    # Compute baseline reconstruction error on clean test flows for anomaly thresholding
-    model.load_state_dict(torch.load(DAE_MODEL_PATH))
-    clean_errors = model.compute_reconstruction_error(X_test_scaled)
-    p95_error = float(np.percentile(clean_errors, 95))
-    p99_error = float(np.percentile(clean_errors, 99))
-    pprint(f"Clean Reconstruction Error Profile -> Mean: {clean_errors.mean():.4f} | 95th-pct: {p95_error:.4f} | 99th-pct: {p99_error:.4f}")
 
-    return model, scaler
+def main():
+    from training import DEFAULT_CONFIG
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', default=DEFAULT_CONFIG)
+    ap.add_argument('--seeds', type=int, nargs='+', default=[RANDOM_STATE])
+    ap.add_argument('--epochs', type=int, default=EPOCHS)
+    a = ap.parse_args()
+    for s in a.seeds:
+        train_denoising_autoencoder(a.config, s, a.epochs)
 
 
 if __name__ == '__main__':
-    train_denoising_autoencoder()
+    main()
