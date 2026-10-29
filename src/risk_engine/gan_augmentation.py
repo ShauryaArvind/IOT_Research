@@ -19,10 +19,18 @@ How it works:
       Discriminator, Discriminator tries not to be fooled. Over many rounds,
       the Generator gets good enough to produce realistic synthetic samples.
 
-We only train this on your WEAK classes (configurable), then use the
-trained Generator to create extra synthetic rows for those classes only,
-which get added to the real (undersampled) training set before training
-the actual classifier.
+The trained Generator creates extra rows for minority attack classes. It is
+used in two places:
+  * data.resample(method='cgan') calls augment_with_cgan() on the training
+    portion of the leakage-free split (this is the 'cgan' config of the
+    balancing ablation, see ablation.py);
+  * running this file directly writes synthetic rows to synthetic_data/ for
+    inspection.
+
+Note: no reported result before the protocol fix used cGAN output. The
+README's old claim that classes 3, 4, 5, 8, 9 were "augmented via cGAN" was
+not true, and classes 4 and 5 are not minority classes (6190 and 5923
+isolated-test rows).
 """
 
 import os
@@ -31,32 +39,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-X_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'X_train_final_balanced.csv')
-Y_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'y_train_final_balanced.csv')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'synthetic_data')
 
-TEST_SIZE = 0.2
 RANDOM_STATE = 42
 NOISE_DIM = 32
 GAN_EPOCHS = 60
 BATCH_SIZE = 128
 LEARNING_RATE = 0.0002
 MAX_ROWS_PER_CLASS_FOR_GAN_TRAINING = 8000  # cap so GAN training stays fast
-
-# Which classes to generate extra synthetic samples for, and how many each.
-# These are the classes that struggled most in the real classifier's results.
-WEAK_CLASSES_TO_BOOST = {
-    3: 15000,
-    4: 15000,
-    5: 15000,
-    8: 15000,
-    9: 15000,
-}
 
 
 class Generator(nn.Module):
@@ -113,37 +107,23 @@ class Discriminator(nn.Module):
         return self.model(combined)
 
 
-def load_training_data():
-    X = pd.read_csv(X_CSV_PATH)
-    y = pd.read_csv(Y_CSV_PATH).iloc[:, 0]
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
-    X = X.values.astype(np.float32)
-    y = y.values.astype(np.int64)
-
-    X_train, _, y_train, _ = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
-    )
-
-    # Cap rows per class so GAN training runs in reasonable time -- the GAN
-    # only needs enough examples per class to learn its distribution, not
-    # every single row.
-    rng = np.random.default_rng(RANDOM_STATE)
-    keep_idx = []
-    for c in np.unique(y_train):
-        class_idx = np.where(y_train == c)[0]
-        if len(class_idx) > MAX_ROWS_PER_CLASS_FOR_GAN_TRAINING:
-            class_idx = rng.choice(class_idx, size=MAX_ROWS_PER_CLASS_FOR_GAN_TRAINING, replace=False)
-        keep_idx.append(class_idx)
-    keep_idx = np.concatenate(keep_idx)
-    rng.shuffle(keep_idx)
-
-    return X_train[keep_idx], y_train[keep_idx]
+def _cap_per_class(X, y, cap, seed):
+    """Cap rows per class so GAN training runs in reasonable time."""
+    rng = np.random.default_rng(seed)
+    keep = []
+    for c in np.unique(y):
+        ix = np.where(y == c)[0]
+        if len(ix) > cap:
+            ix = rng.choice(ix, size=cap, replace=False)
+        keep.append(ix)
+    keep = np.concatenate(keep)
+    rng.shuffle(keep)
+    return X[keep], y[keep]
 
 
-def train_gan(X_train, y_train, num_classes):
-    """Trains ONE conditional GAN across all classes present in X_train/y_train
-    (using real data as the 'real' examples for the discriminator to learn
-    from), so the Generator learns each class's distinct patterns."""
+def train_gan(X_train, y_train, num_classes, epochs=GAN_EPOCHS, seed=RANDOM_STATE, verbose=True):
+    """Trains ONE conditional GAN across all classes present in X_train/y_train."""
+    torch.manual_seed(seed)
     feature_dim = X_train.shape[1]
 
     # Scale to roughly [-1, 1] to match the Generator's Tanh output range
@@ -164,8 +144,9 @@ def train_gan(X_train, y_train, num_classes):
     dataset = torch.utils.data.TensorDataset(X_t, y_t)
     loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
-    print(f"Training Conditional GAN for {GAN_EPOCHS} epochs...")
-    for epoch in range(GAN_EPOCHS):
+    if verbose:
+        print(f"Training Conditional GAN for {epochs} epochs...")
+    for epoch in range(epochs):
         d_loss_total, g_loss_total = 0.0, 0.0
 
         for real_X, real_y in loader:
@@ -180,7 +161,7 @@ def train_gan(X_train, y_train, num_classes):
             d_real_loss = criterion(real_pred, real_labels)
 
             noise = torch.randn(batch_size, NOISE_DIM)
-            gen_labels = torch.randint(0, num_classes, (batch_size,))
+            gen_labels = real_y[torch.randperm(batch_size)]  # only classes present in the data
             fake_X = generator(noise, gen_labels)
             fake_pred = discriminator(fake_X.detach(), gen_labels)
             d_fake_loss = criterion(fake_pred, fake_labels)
@@ -199,74 +180,65 @@ def train_gan(X_train, y_train, num_classes):
             d_loss_total += d_loss.item()
             g_loss_total += g_loss.item()
 
-        if (epoch + 1) % 25 == 0:
-            print(f"  Epoch {epoch+1:3d}/{GAN_EPOCHS} | D loss: {d_loss_total/len(loader):.4f} | "
+        if verbose and (epoch + 1) % 25 == 0:
+            print(f"  Epoch {epoch+1:3d}/{epochs} | D loss: {d_loss_total/len(loader):.4f} | "
                   f"G loss: {g_loss_total/len(loader):.4f}")
 
     return generator, scaler
 
 
 def generate_synthetic_samples(generator, scaler, class_id, n_samples, feature_min, feature_max):
-    """Generate n_samples synthetic feature rows for a specific class,
-    un-scale them back to the original feature space, then clip each
-    feature to the real, observed min/max range -- prevents physically
-    impossible values (e.g. negative packet counts) that a GAN can
-    otherwise produce."""
+    """Generate n_samples rows for one class, un-squash and un-scale them, then
+    clip each feature to the observed min/max of that class's real rows."""
     generator.eval()
     with torch.no_grad():
         noise = torch.randn(n_samples, NOISE_DIM)
         labels = torch.full((n_samples,), class_id, dtype=torch.long)
         synthetic_scaled = generator(noise, labels).numpy()
 
-    synthetic_unsquashed = synthetic_scaled * 4.0
-    synthetic_original = scaler.inverse_transform(synthetic_unsquashed)
-    synthetic_original = np.clip(synthetic_original, feature_min, feature_max)
-    return synthetic_original
+    synthetic_original = scaler.inverse_transform(synthetic_scaled * 4.0)
+    return np.clip(synthetic_original, feature_min, feature_max)
+
+
+def augment_with_cgan(X, y, need, seed=RANDOM_STATE, epochs=GAN_EPOCHS, num_classes=10):
+    """Train a cGAN on (X, y) and return `need[c]` synthetic rows per class c,
+    in the same feature space as X. Used by data.resample(method='cgan')."""
+    X_gan, y_gan = _cap_per_class(X, y, MAX_ROWS_PER_CLASS_FOR_GAN_TRAINING, seed)
+    generator, scaler = train_gan(X_gan, y_gan, num_classes, epochs=epochs, seed=seed)
+    X_new, y_new = [], []
+    for c, n in need.items():
+        if n <= 0:
+            continue
+        real = X[y == c]
+        X_new.append(generate_synthetic_samples(generator, scaler, c, n, real.min(0), real.max(0)))
+        y_new.append(np.full(n, c, dtype=np.int64))
+    if not X_new:
+        return np.empty((0, X.shape[1]), np.float32), np.empty(0, np.int64)
+    return np.vstack(X_new).astype(np.float32), np.concatenate(y_new)
 
 
 def main():
+    from data import BENIGN, load_splits, raw_train_available
+
     print("=" * 70)
     print("Conditional GAN: Synthetic Minority-Class Sample Generation")
     print("=" * 70)
+    resampling = 'none' if raw_train_available() else 'legacy_balanced'
+    if resampling == 'legacy_balanced':
+        print("WARNING: X_train_raw.csv not found; training the cGAN on the SMOTE+Tomek output.")
+    splits = load_splits(resampling=resampling, seed=RANDOM_STATE)
+    X, y = splits.X_train, splits.y_train
+    counts = np.bincount(y, minlength=10)
+    target = int(np.delete(counts, BENIGN).max())
+    need = {c: target - int(counts[c]) for c in range(10) if c != BENIGN and 0 < counts[c] < target}
+    print(f"  Real class counts: {counts.tolist()} -> generating {need}")
 
-    print("\n[1/3] Loading real training data...")
-    X_train, y_train = load_training_data()
-    num_classes = int(y_train.max()) + 1
-    print(f"  Loaded {X_train.shape[0]} rows, {X_train.shape[1]} features, {num_classes} classes")
-    print(f"  Real class counts: {np.bincount(y_train, minlength=num_classes)}")
-
-    print("\n[2/3] Training the Conditional GAN on real data...")
-    generator, scaler = train_gan(X_train, y_train, num_classes)
-
-    print("\n[3/3] Generating synthetic samples for weak classes...")
+    X_new, y_new = augment_with_cgan(X, y, need)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    feature_min = X_train.min(axis=0)
-    feature_max = X_train.max(axis=0)
-
-    all_synthetic_X = []
-    all_synthetic_y = []
-    for class_id, n_samples in WEAK_CLASSES_TO_BOOST.items():
-        synthetic_X = generate_synthetic_samples(
-            generator, scaler, class_id, n_samples, feature_min, feature_max
-        )
-        all_synthetic_X.append(synthetic_X)
-        all_synthetic_y.append(np.full(n_samples, class_id))
-        print(f"  Generated {n_samples} synthetic rows for Class {class_id}")
-
-    synthetic_X = np.vstack(all_synthetic_X)
-    synthetic_y = np.concatenate(all_synthetic_y)
-
-    # Save as CSVs, ready to be concatenated with your real training data
-    feature_cols = pd.read_csv(X_CSV_PATH, nrows=1).columns.tolist()
-    pd.DataFrame(synthetic_X, columns=feature_cols).to_csv(
-        os.path.join(OUTPUT_DIR, 'X_synthetic.csv'), index=False
-    )
-    pd.DataFrame(synthetic_y, columns=['Label']).to_csv(
-        os.path.join(OUTPUT_DIR, 'y_synthetic.csv'), index=False
-    )
-
-    print(f"\nSaved {len(synthetic_y)} synthetic rows to {OUTPUT_DIR}/")
+    pd.DataFrame(splits.prep.inverse(X_new), columns=splits.prep.feature_names).to_csv(
+        os.path.join(OUTPUT_DIR, 'X_synthetic.csv'), index=False)
+    pd.DataFrame(y_new, columns=['Label']).to_csv(os.path.join(OUTPUT_DIR, 'y_synthetic.csv'), index=False)
+    print(f"\nSaved {len(y_new)} synthetic rows (raw feature units) to {OUTPUT_DIR}/")
     print("=" * 70)
 
 

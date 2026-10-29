@@ -5,6 +5,9 @@ ML-based intrusion detection model for network traffic.
 Adapted from the original binary NetworkRiskClassifier to output
 class logits over `num_classes` attack categories (0 = benign,
 1-9 = attack types) instead of a single sigmoid risk score.
+
+input_dim must match the feature CSVs (76 columns in the committed data);
+callers pass it explicitly from the data (data.Splits.input_dim).
 """
 
 import torch
@@ -17,7 +20,7 @@ class NetworkRiskClassifier(nn.Module):
     Outputs raw logits over `num_classes` categories.
     """
 
-    def __init__(self, input_dim=9, num_classes=10):
+    def __init__(self, input_dim=76, num_classes=10):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, 128),

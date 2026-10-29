@@ -3,11 +3,14 @@ Edge Inference Engine for IoT Intrusion Detection & Zero-Trust Verification
 ===========================================================================
 Part of Phase 11: Physical Edge Hardware Deployment & Benchmarking.
 
-Provides a production-grade, low-latency, modular runtime engine designed
-for deployment on IoT edge gateways (Raspberry Pi, Jetson Nano, ARM/x86 gateways).
+A small ONNX Runtime pipeline intended for IoT edge gateways. It has only
+been benchmarked on a general-purpose machine so far. Latency and memory on a
+real gateway (e.g. Raspberry Pi) have not been measured; see edge_benchmark.py,
+which records the host it ran on.
 
 Pipeline:
-  1. Lightweight Preprocessing: In-memory feature standardization via `scaler_params.json`.
+  1. Preprocessing: NaN/inf imputation + standardisation with the training
+     preprocessor exported to `scaler_params.json` by export_onnx.py.
   2. DAE Feature Sanitization: Cleans incoming adversarial flow vectors using ONNX runtime.
   3. Multiclass Neural Classification: Computes logits and class probabilities via ONNX.
   4. Context-Aware Zero-Trust Policy: Evaluates prioritized rules for instant ALLOW / DENY.
@@ -112,25 +115,34 @@ class EdgeDefensePipeline:
             self.scale = np.array(scaler_data['scale'], dtype=np.float32)
             # Avoid divide-by-zero
             self.scale[self.scale == 0] = 1.0
+            fill = scaler_data.get('fill_values')
+            self.fill = np.array(fill, dtype=np.float32) if fill is not None else np.zeros_like(self.mean)
+            self.input_dim = int(scaler_data.get('input_dim', len(self.mean)))
         else:
             self.mean = None
             self.scale = None
+            self.fill = None
+            self.input_dim = None
 
         # 5. Initialize Zero-Trust Engine
         self.zt_engine = ZeroTrustEngine()
 
     def preprocess(self, X: np.ndarray) -> np.ndarray:
         """Standardizes raw flow features using in-memory parameters."""
+        X = np.array(X, dtype=np.float32)
         if self.mean is not None and self.scale is not None:
-            return (X - self.mean) / self.scale
-        return X.astype(np.float32)
+            bad = ~np.isfinite(X)
+            if bad.any():
+                X[bad] = np.broadcast_to(self.fill, X.shape)[bad]
+            return ((X - self.mean) / self.scale).astype(np.float32)
+        return X
 
     def process_flow(self, raw_flow_features: np.ndarray, context: Optional[Dict] = None) -> EdgeInferenceResult:
         """
         Processes a single network flow in real-time through the complete defense pipeline.
 
         Args:
-            raw_flow_features: 1D numpy array of 76 flow features.
+            raw_flow_features: 1D numpy array of raw (unscaled) flow features.
             context: Contextual signals (device_trust, geo_risk, time_of_day, identity_verified).
 
         Returns:
@@ -249,7 +261,7 @@ def run_edge_smoke_test():
     print("=" * 75)
 
     pipeline = EdgeDefensePipeline(enable_dae_sanitization=True)
-    sample_flow = np.zeros(76, dtype=np.float32)
+    sample_flow = np.zeros(pipeline.input_dim or 76, dtype=np.float32)
 
     # 1. Test Clean Benign Flow
     benign_ctx = {'device_trust': 0.9, 'geo_risk': 0.1, 'time_of_day': 14, 'identity_verified': True, 'resource_sensitivity': 0.3}
@@ -262,7 +274,8 @@ def run_edge_smoke_test():
     print(f"[Test 2] Attacker Flow -> Decision: {res_attack.decision} | Rule: {res_attack.rule_fired} | Latency: {res_attack.latency_us:.1f} µs ({res_attack.latency_ms:.3f} ms)")
 
     print("\n" + "=" * 75)
-    print("EDGE INFERENCE PIPELINE OPERATIONAL AND READY FOR BENCHMARKING!")
+    print("Smoke test done. Note: test 2 is denied by context-only rules (device_trust < 0.3),")
+    print("not by the model; see zero_trust_eval.py.")
     print("=" * 75)
 
 

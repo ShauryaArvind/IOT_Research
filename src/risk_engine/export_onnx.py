@@ -3,9 +3,12 @@ ONNX Model Export & Verification Pipeline
 =========================================
 Part of Phase 11: Physical Edge Hardware Deployment & Benchmarking.
 
-Exports trained PyTorch models (Baseline Classifier, Adversarially-Trained Classifier,
-and Denoising Autoencoder) into high-performance, platform-agnostic ONNX format
-for edge devices (Raspberry Pi, Jetson Nano, x86/ARM IoT gateways).
+Exports the trained PyTorch models of one run (baseline classifier, robust
+classifier, denoising autoencoder) to ONNX, and writes scaler_params.json
+from the run's saved preprocessor. Nothing is refitted here, so the
+edge runtime standardises exactly as training did.
+
+    python src/risk_engine/export_onnx.py --config legacy_balanced --seed 42 --robust-defense pgd_at
 """
 
 import os
@@ -19,72 +22,28 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+import argparse
 import json
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import onnx
 import onnxruntime as ort
 
-from Network_classifier import NetworkRiskClassifier
-from denoising_autoencoder import DenoisingAutoencoder
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION & PATHS
+# OUTPUT PATHS (read by edge_inference_engine.py)
 # ---------------------------------------------------------------------------
-X_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'X_train_final_balanced.csv')
-Y_CSV_PATH = os.path.join(os.path.dirname(__file__), '..', '..', 'y_train_final_balanced.csv')
 MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
-
-BASELINE_PTH = os.path.join(MODELS_DIR, 'network_risk_classifier_multiclass.pth')
-ADV_PTH = os.path.join(MODELS_DIR, 'network_risk_classifier_adversarial.pth')
-DAE_PTH = os.path.join(MODELS_DIR, 'denoising_autoencoder.pth')
-
 BASELINE_ONNX = os.path.join(MODELS_DIR, 'network_risk_classifier.onnx')
 ADV_ONNX = os.path.join(MODELS_DIR, 'network_risk_classifier_adv.onnx')
 DAE_ONNX = os.path.join(MODELS_DIR, 'denoising_autoencoder.onnx')
 SCALER_JSON = os.path.join(MODELS_DIR, 'scaler_params.json')
-
-TEST_SIZE = 0.2
-RANDOM_STATE = 42
 
 
 def pprint(*args, **kwargs):
     """Print wrapper forcing immediate stdout flush for real-time logging."""
     print(*args, **kwargs)
     sys.stdout.flush()
-
-
-def get_scaler_and_sample_input():
-    """Fits scaler and generates a representative test batch for ONNX tracing."""
-    pprint("  Extracting feature dimensions and scaler parameters...")
-    X = pd.read_csv(X_CSV_PATH).replace([np.inf, -np.inf], np.nan).fillna(0).values.astype(np.float32)
-    y = pd.read_csv(Y_CSV_PATH).iloc[:, 0].values.astype(np.int64)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
-    )
-
-    scaler = StandardScaler().fit(X_train)
-    input_dim = X_train.shape[1]
-    num_classes = int(y.max()) + 1
-
-    # Save scaler statistics for standalone C/Python edge runtimes
-    scaler_dict = {
-        'input_dim': input_dim,
-        'mean': scaler.mean_.tolist(),
-        'scale': scaler.scale_.tolist(),
-        'var': scaler.var_.tolist()
-    }
-    with open(SCALER_JSON, 'w') as f:
-        json.dump(scaler_dict, f, indent=2)
-    pprint(f"  [+] Scaler parameters saved to: {SCALER_JSON}")
-
-    sample_input = torch.FloatTensor(scaler.transform(X_test[:10]))
-    return input_dim, num_classes, sample_input, scaler
 
 
 def export_model_to_onnx(torch_model, sample_input, onnx_path, input_name='flow_features', output_name='output'):
@@ -111,8 +70,16 @@ def export_model_to_onnx(torch_model, sample_input, onnx_path, input_name='flow_
     # Check onnx graph validity
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
-    file_size_kb = os.path.getsize(onnx_path) / 1024.0
-    return file_size_kb
+    return onnx_size_kb(onnx_path)
+
+
+def onnx_size_kb(onnx_path):
+    """Size of the ONNX graph plus its external weight file (<name>.onnx.data), if any.
+    The legacy footprint numbers counted only the graph file and left out the weights."""
+    total = os.path.getsize(onnx_path)
+    if os.path.exists(onnx_path + '.data'):
+        total += os.path.getsize(onnx_path + '.data')
+    return total / 1024.0
 
 
 def verify_onnx_equivalence(torch_model, onnx_path, sample_input, input_name='flow_features'):
@@ -129,53 +96,52 @@ def verify_onnx_equivalence(torch_model, onnx_path, sample_input, input_name='fl
     return max_diff
 
 
-def export_all_models():
+def _export(name, model, sample_input, onnx_path, output_name):
+    size_kb = export_model_to_onnx(model, sample_input, onnx_path, 'flow_features', output_name)
+    diff = verify_onnx_equivalence(model, onnx_path, sample_input, 'flow_features')
+    status = 'PASSED' if diff < 1e-4 else 'CHECK'
+    pprint(f"  [+] {name} -> {onnx_path} ({size_kb:.1f} KB, incl. external .data if any)")
+    pprint(f"      max |PyTorch - ONNX| on 256 test rows: {diff:.2e} ({status})")
+
+
+def export_all_models(argv=None):
+    from denoising_autoencoder import load_dae
+    from training import DEFAULT_CONFIG, load_run, run_dir, splits_for_config
+
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', default=DEFAULT_CONFIG)
+    ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--robust-defense', default='pgd_at', choices=['pgd_at', 'trades', 'fgsm_at'])
+    a = ap.parse_args(sys.argv[1:] if argv is None else argv)
+
     pprint("=" * 80)
     pprint("PHASE 11: ONNX MODEL EXPORT & NUMERICAL EQUIVALENCE VERIFICATION")
     pprint("=" * 80)
 
-    input_dim, num_classes, sample_input, _ = get_scaler_and_sample_input()
-    pprint(f"  Features: {input_dim} | Target Classes: {num_classes}")
+    base, meta, prep = load_run(run_dir(a.config, 'none', a.seed))
+    with open(SCALER_JSON, 'w') as f:
+        json.dump(prep.to_json_dict(), f, indent=2)
+    pprint(f"  [+] Preprocessor ({meta['scaler_path']}) written to {SCALER_JSON}")
 
-    # 1. Export Baseline Classifier
-    pprint("\n[1/3] Exporting Baseline Multiclass Classifier...")
-    baseline_model = NetworkRiskClassifier(input_dim=input_dim, num_classes=num_classes)
-    if os.path.exists(BASELINE_PTH):
-        baseline_model.load_state_dict(torch.load(BASELINE_PTH, map_location='cpu'))
-        size_kb = export_model_to_onnx(baseline_model, sample_input, BASELINE_ONNX, 'flow_features', 'class_logits')
-        diff = verify_onnx_equivalence(baseline_model, BASELINE_ONNX, sample_input, 'flow_features')
-        pprint(f"  [+] Baseline ONNX exported: {BASELINE_ONNX} ({size_kb:.1f} KB)")
-        pprint(f"  [+] Max absolute numerical difference vs PyTorch: {diff:.2e} (PASSED)")
+    splits = splits_for_config(a.config, a.seed, skip_resampling=True, verbose=False)
+    sample_input = torch.FloatTensor(splits.X_test[:256])
+
+    pprint("\n[1/3] Baseline classifier")
+    _export('baseline', base, sample_input, BASELINE_ONNX, 'class_logits')
+
+    pprint(f"\n[2/3] Robust classifier ({a.robust_defense})")
+    rd = run_dir(a.config, a.robust_defense, a.seed)
+    if (rd / 'classifier.pth').exists():
+        _export(a.robust_defense, load_run(rd)[0], sample_input, ADV_ONNX, 'class_logits')
     else:
-        pprint(f"  [-] Warning: Baseline checkpoint not found at {BASELINE_PTH}")
+        pprint(f"  [-] no run at {rd}; skipped")
 
-    # 2. Export Adversarially-Trained Classifier
-    pprint("\n[2/3] Exporting Adversarially-Trained Classifier...")
-    adv_model = NetworkRiskClassifier(input_dim=input_dim, num_classes=num_classes)
-    if os.path.exists(ADV_PTH):
-        adv_model.load_state_dict(torch.load(ADV_PTH, map_location='cpu'))
-        size_kb = export_model_to_onnx(adv_model, sample_input, ADV_ONNX, 'flow_features', 'class_logits')
-        diff = verify_onnx_equivalence(adv_model, ADV_ONNX, sample_input, 'flow_features')
-        pprint(f"  [+] Adversarially-Trained ONNX exported: {ADV_ONNX} ({size_kb:.1f} KB)")
-        pprint(f"  [+] Max absolute numerical difference vs PyTorch: {diff:.2e} (PASSED)")
-    else:
-        pprint(f"  [-] Warning: Adversarial checkpoint not found at {ADV_PTH}")
-
-    # 3. Export Denoising Autoencoder
-    pprint("\n[3/3] Exporting Denoising Autoencoder Pre-Filter...")
-    dae_model = DenoisingAutoencoder(input_dim=input_dim, latent_dim=16)
-    if os.path.exists(DAE_PTH):
-        dae_model.load_state_dict(torch.load(DAE_PTH, map_location='cpu'))
-        size_kb = export_model_to_onnx(dae_model, sample_input, DAE_ONNX, 'flow_features', 'reconstructed_features')
-        diff = verify_onnx_equivalence(dae_model, DAE_ONNX, sample_input, 'flow_features')
-        pprint(f"  [+] DAE ONNX exported: {DAE_ONNX} ({size_kb:.1f} KB)")
-        pprint(f"  [+] Max absolute numerical difference vs PyTorch: {diff:.2e} (PASSED)")
-    else:
-        pprint(f"  [-] Warning: DAE checkpoint not found at {DAE_PTH}")
-
-    pprint("\n" + "=" * 80)
-    pprint("ALL MODELS SUCCESSFULLY CONVERTED AND VALIDATED FOR EDGE DEPLOYMENT!")
-    pprint("=" * 80)
+    pprint("\n[3/3] Denoising autoencoder")
+    try:
+        dae, _ = load_dae(a.config, a.seed)
+        _export('dae', dae, sample_input, DAE_ONNX, 'reconstructed_features')
+    except FileNotFoundError:
+        pprint("  [-] no DAE run; skipped")
 
 
 if __name__ == '__main__':
